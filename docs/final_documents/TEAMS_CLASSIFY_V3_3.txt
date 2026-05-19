@@ -1,0 +1,590 @@
+/* ============================================================
+   Teams Voice/Video/Other Classifier — 3-CLASS, 5-TREE RF
+   Language : P4_16
+   Target   : BMv2 simple_switch (v1model)
+
+   Architecture:
+     - 5 tree tables, one per RF decision tree
+     - Each matches on 8 features via 'range' match kind
+     - Each tree casts one vote (voice, video, or other)
+     - Majority-vote selector determines final class
+
+   Features (all division-free, 32-bit or 8-bit):
+     1. total_bytes              (flow view, capped)
+     2. min_packet_length_bytes  (flow view)
+     3. max_packet_length_bytes  (flow view)
+     4. current_pkt_len          (packet view — this packet's size)
+     5. outgoing_bytes           (flow view, client→server only)
+     6. iat_sum                  (flow view, total elapsed time in ms)
+     7. iat_max                  (flow view, largest gap in ms)
+     8. ttl                      (packet view, from IP header)
+
+   Direction detection:
+     outgoing = client sent this packet (src_ip == CLIENT_IP)
+     incoming = client received this packet
+     outgoing_bytes = accumulated only when direction == outgoing
+
+   Classification register values:
+     1 = voice, 2 = video, 3 = other
+
+   FIX LOG:
+     v1 — Initial XOR-based hash (bidirectional but collision-prone)
+     v2 — Added UDP validity filter (blocks TCP corruption)
+     v3 — Increased MAX_FLOWS 4096 → 16384 (reduces collision probability)
+     v4 — Replaced XOR hash with canonical min/max bidirectional hash
+          (eliminates cross-flow collisions while preserving bidirectionality)
+   ============================================================ */
+
+#include <core.p4>
+#include <v1model.p4>
+
+// ============================================================
+// SECTION 1 — CONSTANTS
+// ============================================================
+const bit<16> ETHERTYPE_IPV4 = 0x0800;
+const bit<8>  IP_PROTO_UDP   = 17;
+const bit<8>  IP_PROTO_TCP   = 6;
+const bit<32> MAX_FLOWS      = 16384;   // v3: increased from 4096
+const bit<32> CLASSIFY_AFTER = 50;
+
+// Cap values to keep registers bounded
+const bit<32> BYTES_CAP      = 65535;
+
+// Client IP — used for direction detection.
+// 172.16.48.81 → 0xAC103051
+const bit<32> CLIENT_IP      = 0xAC103051;
+
+
+// ============================================================
+// SECTION 2 — HEADERS
+// ============================================================
+header ethernet_h {
+    bit<48> dst_addr;
+    bit<48> src_addr;
+    bit<16> ether_type;
+}
+
+header ipv4_h {
+    bit<4>  version;
+    bit<4>  ihl;
+    bit<8>  diffserv;
+    bit<16> total_len;
+    bit<16> identification;
+    bit<3>  flags;
+    bit<13> frag_offset;
+    bit<8>  ttl;
+    bit<8>  protocol;
+    bit<16> hdr_checksum;
+    bit<32> src_addr;
+    bit<32> dst_addr;
+}
+
+header udp_h {
+    bit<16> src_port;
+    bit<16> dst_port;
+    bit<16> length;
+    bit<16> checksum;
+}
+
+header tcp_h {
+    bit<16> src_port;
+    bit<16> dst_port;
+    bit<32> seq_no;
+    bit<32> ack_no;
+    bit<4>  data_offset;
+    bit<4>  res;
+    bit<8>  flags;
+    bit<16> window;
+    bit<16> checksum;
+    bit<16> urgent_ptr;
+}
+
+struct headers_t {
+    ethernet_h  ethernet;
+    ipv4_h      ipv4;
+    udp_h       udp;
+    tcp_h       tcp;
+}
+
+
+// ============================================================
+// SECTION 3 — METADATA
+// ============================================================
+struct metadata_t {
+    bit<32> flow_id;
+
+    // --- Flow-view features (read from registers, updated) ---
+    bit<32> total_packets;
+    bit<32> total_bytes;
+    bit<32> min_pkt_len;
+    bit<32> max_pkt_len;
+    bit<32> outgoing_bytes;
+    bit<32> iat_sum;        // total elapsed time (ms)
+    bit<32> iat_max;        // largest gap (ms)
+    bit<8>  ttl;            // TTL from IP header
+
+    // --- Packet-view feature ---
+    bit<32> current_pkt_len;
+
+    // --- Timing state (for IAT computation) ---
+    bit<48> last_timestamp;
+    bit<48> current_timestamp;
+    bit<48> iat_us;         // Inter-arrival time in microseconds
+
+    // --- Per-tree votes (0 = none, 1 = voice, 2 = video, 3 = other) ---
+    bit<8> tree1_vote;
+    bit<8> tree2_vote;
+    bit<8> tree3_vote;
+    bit<8> tree4_vote;
+    bit<8> tree5_vote;
+
+    // --- Vote tallies ---
+    bit<8> votes_voice;
+    bit<8> votes_video;
+    bit<8> votes_other;
+
+    // --- Final classification (1/2/3) ---
+    bit<8> result;
+}
+
+
+// ============================================================
+// SECTION 4 — PARSER
+// ============================================================
+parser MyParser(
+    packet_in               pkt,
+    out headers_t           hdr,
+    inout metadata_t        meta,
+    inout standard_metadata_t std_meta)
+{
+    state start { transition parse_ethernet; }
+
+    state parse_ethernet {
+        pkt.extract(hdr.ethernet);
+        transition select(hdr.ethernet.ether_type) {
+            ETHERTYPE_IPV4 : parse_ipv4;
+            default        : accept;
+        }
+    }
+
+    state parse_ipv4 {
+        pkt.extract(hdr.ipv4);
+        transition select(hdr.ipv4.protocol) {
+            IP_PROTO_UDP : parse_udp;
+            IP_PROTO_TCP : parse_tcp;
+            default      : accept;
+        }
+    }
+
+    state parse_udp { pkt.extract(hdr.udp); transition accept; }
+    state parse_tcp { pkt.extract(hdr.tcp); transition accept; }
+}
+
+
+// ============================================================
+// SECTION 5 — VERIFY CHECKSUM (pass-through)
+// ============================================================
+control MyVerifyChecksum(
+    inout headers_t  hdr,
+    inout metadata_t meta)
+{ apply { } }
+
+
+// ============================================================
+// SECTION 6 — INGRESS CONTROL
+// ============================================================
+control MyIngress(
+    inout headers_t           hdr,
+    inout metadata_t          meta,
+    inout standard_metadata_t std_meta)
+{
+    // --- Registers (one slot per flow) ---
+    register<bit<32>>(MAX_FLOWS) reg_total_packets;
+    register<bit<32>>(MAX_FLOWS) reg_total_bytes;
+    register<bit<32>>(MAX_FLOWS) reg_min_pkt_len;
+    register<bit<32>>(MAX_FLOWS) reg_max_pkt_len;
+    register<bit<32>>(MAX_FLOWS) reg_outgoing_bytes;
+    register<bit<48>>(MAX_FLOWS) reg_last_timestamp;
+    register<bit<32>>(MAX_FLOWS) reg_iat_sum;
+    register<bit<32>>(MAX_FLOWS) reg_iat_max;
+    register<bit<8>>(MAX_FLOWS)  reg_ttl;
+    register<bit<8>>(MAX_FLOWS)  reg_classification;
+
+
+    // --------------------------------------------------------
+    // v4 FIX: Canonical bidirectional hash (no XOR).
+    //
+    // XOR caused two problems:
+    //   1. Accidental collision: genuinely different flows
+    //      (e.g. STUN vs SRTP) can XOR to the same key.
+    //   2. TCP packets with undefined UDP header fields
+    //      produce garbage hash inputs.
+    //
+    // Solution: always put the smaller IP first (canonical
+    // ordering). Both directions A→B and B→A produce identical
+    // {ip_lo, ip_hi, port_lo, port_hi} and therefore the same
+    // CRC32 hash slot — bidirectionality preserved, but without
+    // XOR's collision vulnerability.
+    // --------------------------------------------------------
+    action compute_flow_id() {
+        bit<32> ip_lo;
+        bit<32> ip_hi;
+        bit<16> port_lo;
+        bit<16> port_hi;
+
+        if (hdr.ipv4.src_addr < hdr.ipv4.dst_addr) {
+            ip_lo   = hdr.ipv4.src_addr;
+            ip_hi   = hdr.ipv4.dst_addr;
+            port_lo = hdr.udp.src_port;
+            port_hi = hdr.udp.dst_port;
+        } else {
+            ip_lo   = hdr.ipv4.dst_addr;
+            ip_hi   = hdr.ipv4.src_addr;
+            port_lo = hdr.udp.dst_port;
+            port_hi = hdr.udp.src_port;
+        }
+
+        hash(meta.flow_id,
+             HashAlgorithm.crc32,
+             (bit<32>)0,
+             { ip_lo, ip_hi, port_lo, port_hi, hdr.ipv4.protocol },
+             (bit<32>)MAX_FLOWS);
+    }
+
+
+    // --- Packet stats + register update (with IAT) ---
+    action update_flow_stats() {
+        bit<32> pkt_len = (bit<32>)std_meta.packet_length;
+        meta.current_pkt_len = pkt_len;
+        meta.current_timestamp = std_meta.ingress_global_timestamp;
+
+        // Read flow state
+        reg_total_packets.read(meta.total_packets,   meta.flow_id);
+        reg_total_bytes.read(meta.total_bytes,       meta.flow_id);
+        reg_min_pkt_len.read(meta.min_pkt_len,       meta.flow_id);
+        reg_max_pkt_len.read(meta.max_pkt_len,       meta.flow_id);
+        reg_outgoing_bytes.read(meta.outgoing_bytes, meta.flow_id);
+        reg_last_timestamp.read(meta.last_timestamp, meta.flow_id);
+        reg_iat_sum.read(meta.iat_sum,               meta.flow_id);
+        reg_iat_max.read(meta.iat_max,               meta.flow_id);
+        reg_ttl.read(meta.ttl,                       meta.flow_id);
+
+        meta.total_packets = meta.total_packets + 1;
+
+        // total_bytes (capped)
+        if (meta.total_bytes + pkt_len < BYTES_CAP) {
+            meta.total_bytes = meta.total_bytes + pkt_len;
+        } else {
+            meta.total_bytes = BYTES_CAP;
+        }
+
+        // outgoing_bytes — only add if client is sending (capped)
+        if (hdr.ipv4.src_addr == CLIENT_IP) {
+            if (meta.outgoing_bytes + pkt_len < BYTES_CAP) {
+                meta.outgoing_bytes = meta.outgoing_bytes + pkt_len;
+            } else {
+                meta.outgoing_bytes = BYTES_CAP;
+            }
+        }
+
+        // min / max packet length tracking
+        if (meta.total_packets == 1) {
+            meta.min_pkt_len = pkt_len;
+            meta.max_pkt_len = pkt_len;
+            meta.ttl = hdr.ipv4.ttl;   // capture TTL from first packet
+        } else {
+            if (pkt_len < meta.min_pkt_len) { meta.min_pkt_len = pkt_len; }
+            if (pkt_len > meta.max_pkt_len) { meta.max_pkt_len = pkt_len; }
+        }
+
+        // IAT computation (starting from packet 2)
+        if (meta.total_packets > 1) {
+            meta.iat_us = meta.current_timestamp - meta.last_timestamp;
+
+            // Convert µs → ms via bit-shift (>> 10 ≈ ÷ 1024 ≈ ÷ 1000)
+            bit<32> iat_ms = (bit<32>)(meta.iat_us >> 10);
+
+            meta.iat_sum = meta.iat_sum + iat_ms;
+
+            if (iat_ms > meta.iat_max) {
+                meta.iat_max = iat_ms;
+            }
+        }
+
+        // Update timestamp for next packet
+        meta.last_timestamp = meta.current_timestamp;
+
+        // Write back to registers
+        reg_total_packets.write(meta.flow_id,   meta.total_packets);
+        reg_total_bytes.write(meta.flow_id,     meta.total_bytes);
+        reg_min_pkt_len.write(meta.flow_id,     meta.min_pkt_len);
+        reg_max_pkt_len.write(meta.flow_id,     meta.max_pkt_len);
+        reg_outgoing_bytes.write(meta.flow_id,  meta.outgoing_bytes);
+        reg_last_timestamp.write(meta.flow_id,  meta.last_timestamp);
+        reg_iat_sum.write(meta.flow_id,         meta.iat_sum);
+        reg_iat_max.write(meta.flow_id,         meta.iat_max);
+        reg_ttl.write(meta.flow_id,             meta.ttl);
+    }
+
+
+    // --- Tree vote actions (one per tree) ---
+    action tree1_vote_voice() { meta.tree1_vote = 1; }
+    action tree1_vote_video() { meta.tree1_vote = 2; }
+    action tree1_vote_other() { meta.tree1_vote = 3; }
+
+    action tree2_vote_voice() { meta.tree2_vote = 1; }
+    action tree2_vote_video() { meta.tree2_vote = 2; }
+    action tree2_vote_other() { meta.tree2_vote = 3; }
+
+    action tree3_vote_voice() { meta.tree3_vote = 1; }
+    action tree3_vote_video() { meta.tree3_vote = 2; }
+    action tree3_vote_other() { meta.tree3_vote = 3; }
+
+    action tree4_vote_voice() { meta.tree4_vote = 1; }
+    action tree4_vote_video() { meta.tree4_vote = 2; }
+    action tree4_vote_other() { meta.tree4_vote = 3; }
+
+    action tree5_vote_voice() { meta.tree5_vote = 1; }
+    action tree5_vote_video() { meta.tree5_vote = 2; }
+    action tree5_vote_other() { meta.tree5_vote = 3; }
+
+
+    // --- Tree tables (8-feature range match) ---
+
+    table table_tree1 {
+        key = {
+            meta.total_bytes       : range;
+            meta.min_pkt_len       : range;
+            meta.max_pkt_len       : range;
+            meta.current_pkt_len   : range;
+            meta.outgoing_bytes    : range;
+            meta.iat_sum           : range;
+            meta.iat_max           : range;
+            meta.ttl               : range;
+        }
+        actions = {
+            tree1_vote_voice;
+            tree1_vote_video;
+            tree1_vote_other;
+        }
+        default_action = tree1_vote_other();
+        size = 32;
+    }
+
+    table table_tree2 {
+        key = {
+            meta.total_bytes       : range;
+            meta.min_pkt_len       : range;
+            meta.max_pkt_len       : range;
+            meta.current_pkt_len   : range;
+            meta.outgoing_bytes    : range;
+            meta.iat_sum           : range;
+            meta.iat_max           : range;
+            meta.ttl               : range;
+        }
+        actions = {
+            tree2_vote_voice;
+            tree2_vote_video;
+            tree2_vote_other;
+        }
+        default_action = tree2_vote_other();
+        size = 64;
+    }
+
+    table table_tree3 {
+        key = {
+            meta.total_bytes       : range;
+            meta.min_pkt_len       : range;
+            meta.max_pkt_len       : range;
+            meta.current_pkt_len   : range;
+            meta.outgoing_bytes    : range;
+            meta.iat_sum           : range;
+            meta.iat_max           : range;
+            meta.ttl               : range;
+        }
+        actions = {
+            tree3_vote_voice;
+            tree3_vote_video;
+            tree3_vote_other;
+        }
+        default_action = tree3_vote_other();
+        size = 32;
+    }
+
+    table table_tree4 {
+        key = {
+            meta.total_bytes       : range;
+            meta.min_pkt_len       : range;
+            meta.max_pkt_len       : range;
+            meta.current_pkt_len   : range;
+            meta.outgoing_bytes    : range;
+            meta.iat_sum           : range;
+            meta.iat_max           : range;
+            meta.ttl               : range;
+        }
+        actions = {
+            tree4_vote_voice;
+            tree4_vote_video;
+            tree4_vote_other;
+        }
+        default_action = tree4_vote_other();
+        size = 32;
+    }
+
+    table table_tree5 {
+        key = {
+            meta.total_bytes       : range;
+            meta.min_pkt_len       : range;
+            meta.max_pkt_len       : range;
+            meta.current_pkt_len   : range;
+            meta.outgoing_bytes    : range;
+            meta.iat_sum           : range;
+            meta.iat_max           : range;
+            meta.ttl               : range;
+        }
+        actions = {
+            tree5_vote_voice;
+            tree5_vote_video;
+            tree5_vote_other;
+        }
+        default_action = tree5_vote_other();
+        size = 64;
+    }
+
+
+    // --- Voting: tally 5 votes, pick majority class ---
+    action tally_votes() {
+        meta.votes_voice = 0;
+        meta.votes_video = 0;
+        meta.votes_other = 0;
+
+        if (meta.tree1_vote == 1) { meta.votes_voice = meta.votes_voice + 1; }
+        if (meta.tree1_vote == 2) { meta.votes_video = meta.votes_video + 1; }
+        if (meta.tree1_vote == 3) { meta.votes_other = meta.votes_other + 1; }
+
+        if (meta.tree2_vote == 1) { meta.votes_voice = meta.votes_voice + 1; }
+        if (meta.tree2_vote == 2) { meta.votes_video = meta.votes_video + 1; }
+        if (meta.tree2_vote == 3) { meta.votes_other = meta.votes_other + 1; }
+
+        if (meta.tree3_vote == 1) { meta.votes_voice = meta.votes_voice + 1; }
+        if (meta.tree3_vote == 2) { meta.votes_video = meta.votes_video + 1; }
+        if (meta.tree3_vote == 3) { meta.votes_other = meta.votes_other + 1; }
+
+        if (meta.tree4_vote == 1) { meta.votes_voice = meta.votes_voice + 1; }
+        if (meta.tree4_vote == 2) { meta.votes_video = meta.votes_video + 1; }
+        if (meta.tree4_vote == 3) { meta.votes_other = meta.votes_other + 1; }
+
+        if (meta.tree5_vote == 1) { meta.votes_voice = meta.votes_voice + 1; }
+        if (meta.tree5_vote == 2) { meta.votes_video = meta.votes_video + 1; }
+        if (meta.tree5_vote == 3) { meta.votes_other = meta.votes_other + 1; }
+    }
+
+
+    action pick_majority() {
+        // Tie-break order: video > voice > other
+        if (meta.votes_video >= meta.votes_voice && meta.votes_video >= meta.votes_other) {
+            meta.result = 2;
+        } else if (meta.votes_voice >= meta.votes_other) {
+            meta.result = 1;
+        } else {
+            meta.result = 3;
+        }
+        reg_classification.write(meta.flow_id, meta.result);
+    }
+
+
+    // --- Simple forwarding ---
+    action forward(bit<9> port) { std_meta.egress_spec = port; }
+    action drop_pkt() { mark_to_drop(std_meta); }
+
+    table ipv4_forward {
+        key = { hdr.ipv4.dst_addr : lpm; }
+        actions = { forward; drop_pkt; }
+        default_action = drop_pkt();
+        size = 256;
+    }
+
+
+    // --- Apply block ---
+    // v2 FIX: guard on hdr.udp.isValid() prevents TCP packets
+    // from being hashed via undefined UDP header fields, which
+    // previously corrupted register state at shared hash slots.
+    apply {
+        if (hdr.ipv4.isValid() && hdr.udp.isValid()) {
+            compute_flow_id();
+            update_flow_stats();
+
+            // Single-shot: classify at exactly packet 50
+            if (meta.total_packets == CLASSIFY_AFTER) {
+                table_tree1.apply();
+                table_tree2.apply();
+                table_tree3.apply();
+                table_tree4.apply();
+                table_tree5.apply();
+                tally_votes();
+                pick_majority();
+            }
+
+            ipv4_forward.apply();
+        }
+    }
+}
+
+
+// ============================================================
+// SECTION 7 — EGRESS (pass-through)
+// ============================================================
+control MyEgress(
+    inout headers_t           hdr,
+    inout metadata_t          meta,
+    inout standard_metadata_t std_meta)
+{ apply { } }
+
+
+// ============================================================
+// SECTION 8 — COMPUTE CHECKSUM
+// ============================================================
+control MyComputeChecksum(
+    inout headers_t  hdr,
+    inout metadata_t meta)
+{
+    apply {
+        update_checksum(
+            hdr.ipv4.isValid(),
+            { hdr.ipv4.version, hdr.ipv4.ihl,
+              hdr.ipv4.diffserv, hdr.ipv4.total_len,
+              hdr.ipv4.identification, hdr.ipv4.flags,
+              hdr.ipv4.frag_offset, hdr.ipv4.ttl,
+              hdr.ipv4.protocol, hdr.ipv4.src_addr,
+              hdr.ipv4.dst_addr },
+            hdr.ipv4.hdr_checksum,
+            HashAlgorithm.csum16);
+    }
+}
+
+
+// ============================================================
+// SECTION 9 — DEPARSER
+// ============================================================
+control MyDeparser(packet_out pkt, in headers_t hdr)
+{
+    apply {
+        pkt.emit(hdr.ethernet);
+        pkt.emit(hdr.ipv4);
+        pkt.emit(hdr.udp);
+        pkt.emit(hdr.tcp);
+    }
+}
+
+
+// ============================================================
+// SECTION 10 — INSTANTIATION
+// ============================================================
+V1Switch(
+    MyParser(),
+    MyVerifyChecksum(),
+    MyIngress(),
+    MyEgress(),
+    MyComputeChecksum(),
+    MyDeparser()
+) main;
